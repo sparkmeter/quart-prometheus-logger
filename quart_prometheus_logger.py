@@ -63,6 +63,7 @@ class PrometheusRegistry:
         :param metrics_endpoint: The endpoint that will be scraped by Prometheus,
                             under this endpoint, the /metrics url will be registered, defaults to "root"
         """
+        # TODO: Add custom metrics support
         self._collectors: Dict[str, MetricType] = {}
         self._custom_labeler: Optional[Callable[["LocalProxy"], Dict[str, str]]] = None
         self._custom_label_names: List[str] = []
