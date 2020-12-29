@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest, CollectorRegistry
@@ -50,6 +51,8 @@ REQUEST_BUCKETS = (
     *linear_bucket(1000000, 10000, 5),
 )
 
+EntityID = Union[str, uuid.UUID]
+
 
 class PrometheusRegistry:
     """A prometheus logger.
@@ -76,7 +79,7 @@ class PrometheusRegistry:
     def init_app(self, app: Quart, metrics_endpoint: str):
         """Register an application."""
 
-        def prometheus_before_request_callback():
+        def on_request_start():
             if request.path == "/metrics":
                 return
             g.start = now_utc()  # type: ignore  # This is a valid use of Quart's global object
@@ -85,7 +88,7 @@ class PrometheusRegistry:
                 request.content_length or 0
             )
 
-        def prometheus_after_request_callback(response: Response):
+        def on_request_end(response: Response):
             if request.path == "/metrics":
                 return response
             if not hasattr(g, "start"):
@@ -108,26 +111,26 @@ class PrometheusRegistry:
                 ).inc()
             return response
 
-        def prometheus_error_handler(exc: Union[HTTPException, Exception]) -> Response:
+        def on_request_error(exc: Union[HTTPException, Exception]) -> Response:
             if isinstance(exc, HTTPException):
                 response = exc.get_response()
             else:
                 response = Response("", 500)
-            return prometheus_after_request_callback(response)
+            return on_request_end(response)
 
         self.app = app
         app.before_request(
-            prometheus_before_request_callback,
-            prometheus_before_request_callback.__name__,
+            on_request_start,
+            on_request_start.__name__,
         )
         app.after_request(
-            prometheus_after_request_callback,
-            prometheus_after_request_callback.__name__,
+            on_request_end,
+            on_request_end.__name__,
         )
         app.register_error_handler(
             HTTPStatusException,
-            prometheus_error_handler,  # type:ignore
-            prometheus_error_handler.__name__,
+            on_request_error,  # type: ignore
+            on_request_error.__name__,
         )
         app.add_url_rule("/metrics", metrics_endpoint, view_func=self.render)
 
@@ -183,8 +186,7 @@ class PrometheusRegistry:
 
         This will reset all metrics. Conventionally it's called when the extension is first registered
 
-        :param labeler: The handler function to invoke. It takes a Quart LocalProxy representing
-                    the request, from which values for the custom label can be pulled. It must return
+        :param labeler: The handler function to invoke. It must accept a request proxy, from which values for the custom label can be pulled. It must return
                     a dict of key-value labels.
         :param label_names: The possible label names emitted by the labeler.
         """
