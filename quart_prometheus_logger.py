@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
-from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Counter, Histogram, generate_latest
+
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest, CollectorRegistry
 from quart import Response, g, request
 from quart.exceptions import HTTPException, HTTPStatusException
-from .utils import now_utc
+
+from utils import now_utc
 
 if TYPE_CHECKING:
     from quart import Quart
@@ -48,6 +51,8 @@ REQUEST_BUCKETS = (
     *linear_bucket(1000000, 10000, 5),
 )
 
+EntityID = Union[str, uuid.UUID]
+
 
 class PrometheusRegistry:
     """A prometheus logger.
@@ -66,6 +71,7 @@ class PrometheusRegistry:
         self._collectors: Dict[str, MetricType] = {}
         self._custom_labeler: Optional[Callable[["LocalProxy"], Dict[str, str]]] = None
         self._custom_label_names: List[str] = []
+        self._registry = CollectorRegistry()
         self._register_collectors()
         if app:
             self.init_app(app, metrics_endpoint)
@@ -73,7 +79,7 @@ class PrometheusRegistry:
     def init_app(self, app: Quart, metrics_endpoint: str):
         """Register an application."""
 
-        def start_request():
+        def on_request_start():
             if request.path == "/metrics":
                 return
             g.start = now_utc()  # type: ignore  # This is a valid use of Quart's global object
@@ -82,7 +88,7 @@ class PrometheusRegistry:
                 request.content_length or 0
             )
 
-        def end_request(response):
+        def on_request_end(response: Response):
             if request.path == "/metrics":
                 return response
             if not hasattr(g, "start"):
@@ -105,17 +111,27 @@ class PrometheusRegistry:
                 ).inc()
             return response
 
-        def abort_with_error(exc: Union[HTTPException, Exception]) -> Response:
+        def on_request_error(exc: Union[HTTPException, Exception]) -> Response:
             if isinstance(exc, HTTPException):
                 response = exc.get_response()
             else:
                 response = Response("", 500)
-            return end_request(response)
+            return on_request_end(response)
 
         self.app = app
-        app.before_request(start_request)
-        app.after_request(end_request)
-        app.register_error_handler(HTTPStatusException, abort_with_error)
+        app.before_request(
+            on_request_start,
+            on_request_start.__name__,
+        )
+        app.after_request(
+            on_request_end,
+            on_request_end.__name__,
+        )
+        app.register_error_handler(
+            HTTPStatusException,
+            on_request_error,  # type: ignore
+            on_request_error.__name__,
+        )
         app.add_url_rule("/metrics", metrics_endpoint, view_func=self.render)
 
     def _register_collectors(self):
@@ -127,31 +143,41 @@ class PrometheusRegistry:
                     "http_requests",
                     "Total number of requests",
                     ["method", "path", "status", *self._custom_label_names],
+                    registry=self._registry,
                 ),
                 Counter(
                     "http_requests_errors",
                     "Total number of error requests",
                     ["method", "path", "status", *self._custom_label_names],
+                    registry=self._registry,
                 ),
                 Histogram(
                     "http_request_duration_seconds",
                     "The amount of time spent handling requests",
                     ["path", *self._custom_label_names],
+                    registry=self._registry,
                 ),
                 Histogram(
                     "http_request_size_bytes",
                     "The size of requests",
                     ["path", *self._custom_label_names],
                     buckets=REQUEST_BUCKETS,
+                    registry=self._registry,
                 ),
                 Histogram(
                     "http_response_size_bytes",
                     "The size of responses",
                     ["path", *self._custom_label_names],
                     buckets=RESPONSE_BUCKETS,
+                    registry=self._registry,
                 ),
             )
         }
+
+    def _reset_metrics(self):
+        """Unregister all collectors from the registry."""
+        for _, collector in self._collectors.items():
+            self._registry.unregister(collector)
 
     def custom_route_labeler(
         self, labeler: Callable[["LocalProxy"], Dict[str, str]], label_names: List[str]
@@ -160,13 +186,13 @@ class PrometheusRegistry:
 
         This will reset all metrics. Conventionally it's called when the extension is first registered
 
-        :param labeler: The handler function to invoke. It must return a dict of key-value labels.
+        :param labeler: The handler function to invoke. It must accept a request proxy, from which values for the custom label can be pulled. It must return
+                    a dict of key-value labels.
         :param label_names: The possible label names emitted by the labeler.
         """
         self._custom_labeler = labeler
         self._custom_label_names = label_names
-        for _, collector in self._collectors.items():
-            REGISTRY.unregister(collector)
+        self._reset_metrics()
         self._register_collectors()
 
     def get(self, name: str) -> MetricType:
@@ -181,4 +207,3 @@ class PrometheusRegistry:
     def render():
         """Render the stats."""
         return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
-
